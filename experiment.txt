@@ -1,0 +1,64 @@
+func ProjectCard(p *Project) ingot.Element {
+  return <a class="project-card flex items-start g3 overflow-hidden pa3" href={{ p.Url }}>
+    <div class="project-card-logo">
+      <ProjectLogo project={{ p }} />
+    </div>
+    <div class="details flex-grow-1">
+      <h3 class="b mb2 f4">{{ p.Name }}</h3>
+      <div class="blurb">{{ p.Blurb }}</div>
+      {{ if p.Owners }}
+        <hr class="mv3">
+        <div class="flex flex-wrap g2">
+          {{ for _, owner := range p.Owners }}
+            <div class="flex g1 items-center b">
+              <img class="avatar avatar-user avatar-small" src={{ owner.AvatarUrl }}>
+              <span>{{ owner.Name }}</span>
+            </div>
+          {{ end }}
+        </div>
+      {{ end }}
+    </div>
+  </a>
+}
+
+type WideAtts struct {
+  Class string // TODO: Some special class type?
+}
+
+func Wide(wideness string, atts WideAtts) {
+  children = bhp.nosource(children)
+
+  return <div
+    class="wide flex justify-center mv4"
+    // TODO
+    style={{ atts.wideness ? ("--wideness: " + atts.wideness) : "" }}
+  >
+    // TODO
+    <div class={{
+      "flex flex-column flex-row-l",
+      atts.class || "items-center",
+      "g4"
+    }}>
+      <!--
+        Because this for loop is used in an expression context, it just produces children for the
+        parent node directly. If you use it in other contexts then of course it's just a plain old
+        for loop. 
+
+        What data does it produce? Probably it needs to occur inside a tag so that it can just
+        append children. It wouldn't make sense for it to return a slice; if you need a slice of
+        elements you can do a map function or build it manually in a procedural part of a function.
+
+        Could it literally be sugar for a map function? Seems plausible. Break and continue seem
+        most dubious in that regard. Don't need them right away. Maybe most questionable is that a
+        map function would want to return...a fragment? Rather than appending children to a parent
+        directly. Is there a meaningful difference? I think probably it's best to append children
+        directly.
+      -->
+      {{ for _, child := range children }}
+        <div class="w-100 flex-fair-l p-dumb">
+          {{ child }}
+        </div>
+      {{ end }}
+    </div>
+  </div>
+}
