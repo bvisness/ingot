@@ -120,9 +120,10 @@ func (p *ingotParser) Lex() (token.Pos, token.Token, string) {
 
 		if tokenCanPrecedeTag(p.prevGoTok) && tok == token.LSS {
 			// NOTE(ben): Saw '<' in a place where tags can go; switch to Ingot and
-			// re-lex
+			// re-lex the '<' as a tag start
 			p.pushOuterState()
 			p.state = ipTag
+			p.cur = int(pos) - p.file.Base()
 			return p.Lex()
 		}
 		if tok == token.RBRACE && p.remaining() > 0 && p.src[p.cur] == '}' {
