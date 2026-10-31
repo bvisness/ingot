@@ -17,13 +17,14 @@ type ingotParser struct {
 	state       ingotParserState
 	outerStates []ingotParserState
 
+	// Position in the file. Kept in sync with the Go scanner since it has its
+	// own cursor.
+	cur int
+
 	// For Go lexing
 	s          scanner.Scanner
 	prevGoTok  token.Token
 	blankedCur int
-
-	// For Ingot lexing
-	cur int
 }
 
 type ingotParserState int
