@@ -86,7 +86,7 @@ const (
 
 	Ident       // e.g. div, my-element, FooBar123
 	Eq          // =
-	Quote       // "
+	String      // "foo"
 	GoExprStart // {{
 
 	// NOTE(ben): For loops, if/else, etc. are lexed using the actual Go scanner.
@@ -103,7 +103,7 @@ var operators = []operator{
 	{"</", ClosingTagStart}, {"/>", TagEndClosed},
 	{"<", TagStart}, {">", TagEndUnclosed},
 
-	{"=", Eq}, {`"`, Quote}, {"{{", GoExprStart},
+	{"=", Eq}, {"{{", GoExprStart},
 }
 
 func (p *ingotParser) Lex() (token.Pos, token.Token, string) {
@@ -146,6 +146,9 @@ func (p *ingotParser) Lex() (token.Pos, token.Token, string) {
 		}
 		if pos, ident := p.lexIdent(); ident != "" {
 			return pos, Ident, ident
+		}
+		if pos, tok, lit := p.lexString(); pos != token.NoPos {
+			return pos, tok, lit
 		}
 
 		pos := p.pos()
@@ -199,7 +202,7 @@ func (p *ingotParser) Lex() (token.Pos, token.Token, string) {
 				return pos, op.tok, op.lit
 			}
 		}
-		if pos, ident := p.lexIdent(); ident != "" {
+		if pos, ident := p.lexIdent(); pos != token.NoPos {
 			return pos, Ident, ident
 		}
 
@@ -230,6 +233,33 @@ func (p *ingotParser) lexIdent() (token.Pos, string) {
 		return p.posAt(start), string(p.src[start:p.cur])
 	}
 	return token.NoPos, ""
+}
+
+func (p *ingotParser) lexString() (token.Pos, token.Token, string) {
+	utils.Assert(p.remaining() > 0)
+	start := p.cur
+	if p.src[p.cur] == '"' {
+		p.cur++
+		escapeNext := false
+		for ; ; p.cur++ {
+			if p.remaining() == 0 {
+				return p.posAt(start), token.ILLEGAL, string(p.src[start:])
+			}
+			if escapeNext {
+				escapeNext = false
+				continue
+			}
+
+			switch p.src[p.cur] {
+			case '"':
+				p.cur++
+				return p.pos(), token.STRING, string(p.src[start:p.cur])
+			case '\\':
+				escapeNext = true
+			}
+		}
+	}
+	return token.NoPos, token.ILLEGAL, ""
 }
 
 func (p *ingotParser) pushOuterState() {
