@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go/scanner"
 	"go/token"
+	"reflect"
 
 	"github.com/bvisness/ingot/utils"
 )
@@ -18,7 +19,7 @@ type ingotParser struct {
 
 	// For Go lexing
 	s          scanner.Scanner
-	prevTok    token.Token
+	prevGoTok  token.Token
 	blankedCur int
 
 	// For Ingot lexing
@@ -88,6 +89,7 @@ const (
 	Eq          // =
 	String      // "foo"
 	GoExprStart // {{
+	GoExprEnd   // }}
 
 	// NOTE(ben): For loops, if/else, etc. are lexed using the actual Go scanner.
 )
@@ -104,6 +106,8 @@ var operators = []operator{
 	{"<", TagStart}, {">", TagEndUnclosed},
 
 	{"=", Eq}, {"{{", GoExprStart},
+	// NOTE(ben): We don't include GoExprEnd here because it is encountered
+	// specially by the Go scanner, not by the Ingot lexer.
 }
 
 func (p *ingotParser) Lex() (token.Pos, token.Token, string) {
@@ -111,14 +115,23 @@ func (p *ingotParser) Lex() (token.Pos, token.Token, string) {
 	case ipGo:
 		// NOTE(ben): Lex a Go token
 		pos, tok, lit := p.s.Scan()
-		if tokenCanPrecedeTag(p.prevTok) && tok == token.LSS {
-			// NOTE(ben): Switch to Ingot and re-lex
+		// NOTE(ben): Sync general cursor with the Go scanner.
+		p.cur = scannerOffset(&p.s)
+
+		if tokenCanPrecedeTag(p.prevGoTok) && tok == token.LSS {
+			// NOTE(ben): Saw '<' in a place where tags can go; switch to Ingot and
+			// re-lex
 			p.pushOuterState()
 			p.state = ipTag
-			p.cur = int(pos) - p.file.Base()
 			return p.Lex()
 		}
-		p.prevTok = tok
+		if tok == token.RBRACE && p.remaining() > 0 && p.src[p.cur] == '}' {
+			// NOTE(ben): Crude way of detecting '}}', which switches back to Ingot
+			p.state = p.popOuterState()
+			p.cur = int(pos+2) - p.file.Base()
+			return pos, GoExprEnd, "}}"
+		}
+		p.prevGoTok = tok
 		return pos, tok, lit
 	case ipTag:
 		// NOTE(ben): Advance past whitespace, maybe EOF
@@ -138,9 +151,18 @@ func (p *ingotParser) Lex() (token.Pos, token.Token, string) {
 				case TagEndUnclosed:
 					// NOTE(ben): Now inside the tag
 					p.state = ipTagContents
+				case GoExprStart:
+					// NOTE(ben): Go expression inside the tag somewhere. Switch back to
+					// Go and note that we just parsed a `<` from Go's perspective so we
+					// don't have to worry about semicolon insertion below.
+					p.pushOuterState()
+					p.state = ipGo
 				}
 				pos := p.pos()
 				p.cur += len(op.lit)
+				if p.state == ipGo {
+					p.blankOutIngotCodeAndResetScanner()
+				}
 				return pos, op.tok, op.lit
 			}
 		}
@@ -191,12 +213,10 @@ func (p *ingotParser) Lex() (token.Pos, token.Token, string) {
 				p.cur += len(op.lit)
 				if p.state == ipGo {
 					// NOTE(ben): Reset Go scanner
-					for i := p.blankedCur; i < p.cur; i++ {
-						p.src[i] = ' '
-					}
-					p.src[p.cur-1] = '_' // NOTE(ben): Reset semicolon insertion
-					p.s.Init(p.file, p.src, p.scanErrorHandler, scanner.ScanComments)
+					p.blankOutIngotCodeAndResetScanner()
+					p.src[p.cur-1] = '_'          // NOTE(ben): Reset semicolon insertion
 					_, goTok, goLit := p.s.Scan() // NOTE(ben): Consume the underscore
+					p.prevGoTok = token.ILLEGAL
 					utils.Assert(goTok == token.IDENT && goLit == "_")
 				}
 				return pos, op.tok, op.lit
@@ -285,6 +305,15 @@ func (p *ingotParser) remaining() int {
 	return len(p.src) - p.cur
 }
 
+func (p *ingotParser) blankOutIngotCodeAndResetScanner() {
+	for i := p.blankedCur; i < p.cur; i++ {
+		p.src[i] = ' '
+	}
+	p.blankedCur = p.cur
+	p.s.Init(p.file, p.src, p.scanErrorHandler, scanner.ScanComments)
+	p.prevGoTok = token.ILLEGAL
+}
+
 func (p *ingotParser) eof() (token.Pos, token.Token, string) {
 	return p.posAt(len(p.src)), token.EOF, ""
 }
@@ -308,4 +337,13 @@ func isspace(c byte) bool {
 	default:
 		return false
 	}
+}
+
+// NOTE(ben): The Go [scanner.Scanner] type hides its cursor position,
+// `.offset`, for absolutely no good reason.
+//
+// The result of this is a direct index into the source file, so equivalent
+// to `p.cur`.
+func scannerOffset(s *scanner.Scanner) int {
+	return int(reflect.ValueOf(s).Elem().FieldByName("offset").Int())
 }
