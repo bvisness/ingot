@@ -3,7 +3,8 @@ package ingot
 import "testing"
 
 func TestIngot2Go(t *testing.T) {
-	ParseFile("test.ingot", []byte(`package template
+	t.Run("simple", func(t *testing.T) {
+		ParseFile("test.ingot", []byte(`package template
 	
 func Foo(name string, class string) {
 	return <div class={{ "foo " + <foo/> }}>
@@ -11,4 +12,19 @@ func Foo(name string, class string) {
 	</div>
 }
 `))
+	})
+	t.Run("loop", func(t *testing.T) {
+		ParseFile("test.ingot", []byte(`package template
+	
+func Foo(names []string) {
+	return <div>
+		Hello
+		{{ for i, name := range names }}
+		 	{{ if i > 0 }}, {{ end }}{{ name }}
+		{{ end }}
+		!
+	</div>
+}
+`))
+	})
 }

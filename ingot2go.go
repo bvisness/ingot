@@ -9,36 +9,9 @@ import (
 	"github.com/bvisness/ingot/utils"
 )
 
-type ingotScanner struct {
-	src  []byte
-	fset *token.FileSet
-	file *token.File
-
-	state       ingotParserState
-	outerStates []ingotParserState
-
-	// Position in the file. Kept in sync with the Go scanner since it has its
-	// own cursor.
-	cur int
-
-	// For Go lexing
-	goScanner  scanner.Scanner
-	prevGoTok  token.Token
-	blankedCur int
-}
-
-type ingotParserState int
-
-const (
-	ipGo ingotParserState = iota
-	ipTag
-	ipTagContents
-	ipClosingTag
-)
-
 // For stupid reasons, this will modify `src`.
 func ParseFile(filename string, src []byte) {
-	var p ingotScanner
+	var p ingotLexer
 
 	p.src = src
 	p.fset = token.NewFileSet()
@@ -56,28 +29,10 @@ func ParseFile(filename string, src []byte) {
 	}
 }
 
-// NOTE(ben): This is far from an exact science. Certainly we need to avoid
-// those places where it is valid to put a less-than operator. But outside of
-// that, there are still many places where it is invalid to put a Go struct as
-// well, and at that point the question is: do you want the error to be a bad
-// less-than, or a bad struct?
-func tokenCanPrecedeTag(tok token.Token) bool {
-	switch tok {
-	case token.RETURN:
-		return true
-	case
-		token.INC, token.DEC,
-		token.PERIOD,
-		token.RPAREN, token.RBRACK, token.RBRACE,
-		token.SEMICOLON:
-		return false
-	default:
-		return tok.IsOperator()
-	}
-}
+const ingotTokenStart = 1000
 
 const (
-	TagContents token.Token = iota + 1001
+	TagContents token.Token = iota + ingotTokenStart
 
 	TagStart        // <
 	ClosingTagStart // </
@@ -108,204 +63,231 @@ var operators = []operator{
 	// specially by the Go scanner, not by the Ingot lexer.
 }
 
-func (s *ingotScanner) Lex() (token.Pos, token.Token, string) {
-	switch s.state {
-	case ipGo:
-		// NOTE(ben): Lex a Go token
-		pos, tok, lit := s.goScanner.Scan()
-		// NOTE(ben): Sync general cursor with the Go scanner.
-		s.cur = scannerOffset(&s.goScanner)
+type ingotLexer struct {
+	src  []byte
+	fset *token.FileSet
+	file *token.File
 
-		if tokenCanPrecedeTag(s.prevGoTok) && tok == token.LSS {
+	state       ingotLexerState
+	outerStates []ingotLexerState
+
+	// Position in the file. Kept in sync with the Go scanner since it has its
+	// own cursor.
+	cur int
+
+	// For Go lexing
+	goScanner  scanner.Scanner
+	prevGoTok  token.Token
+	blankedCur int
+}
+
+type ingotLexerState int
+
+const (
+	ilStateGo ingotLexerState = iota
+	ilStateTag
+	ilStateTagContents
+	ilStateClosingTag
+)
+
+func (l *ingotLexer) Lex() (token.Pos, token.Token, string) {
+	switch l.state {
+	case ilStateGo:
+		// NOTE(ben): Lex a Go token
+		pos, tok, lit := l.goScanner.Scan()
+		// NOTE(ben): Sync general cursor with the Go scanner.
+		l.cur = scannerOffset(&l.goScanner)
+
+		if tokenCanPrecedeTag(l.prevGoTok) && tok == token.LSS {
 			// NOTE(ben): Saw '<' in a place where tags can go; switch to Ingot and
 			// re-lex the '<' as a tag start
-			s.pushOuterState()
-			s.state = ipTag
-			s.cur = int(pos) - s.file.Base()
-			return s.Lex()
+			l.pushOuterState()
+			l.state = ilStateTag
+			l.cur = int(pos) - l.file.Base()
+			return l.Lex()
 		}
-		if tok == token.RBRACE && s.remaining() > 0 && s.src[s.cur] == '}' {
+		if tok == token.RBRACE && l.remaining() > 0 && l.src[l.cur] == '}' {
 			// NOTE(ben): Crude way of detecting '}}', which switches back to Ingot
-			s.state = s.popOuterState()
-			s.cur = int(pos+2) - s.file.Base()
+			l.state = l.popOuterState()
+			l.cur = int(pos+2) - l.file.Base()
 			return pos, GoExprEnd, "}}"
 		}
-		s.prevGoTok = tok
+		l.prevGoTok = tok
 		return pos, tok, lit
-	case ipTag:
+	case ilStateTag:
 		// NOTE(ben): Advance past whitespace, maybe EOF
-		for s.remaining() > 0 && isspace(s.src[s.cur]) {
-			s.cur++
+		for l.remaining() > 0 && isspace(l.src[l.cur]) {
+			l.cur++
 		}
-		if s.remaining() == 0 {
-			return s.eof()
+		if l.remaining() == 0 {
+			return l.eof()
 		}
 
-		if pos, op := s.lexOperator(); pos != token.NoPos {
+		if pos, op := l.lexOperator(); pos != token.NoPos {
 			switch op.tok {
 			case TagEndClosed:
 				// NOTE(ben): Tag self-closed; back to previous state
-				s.state = s.popOuterState()
+				l.state = l.popOuterState()
 			case TagEndUnclosed:
 				// NOTE(ben): Now inside the tag
-				s.state = ipTagContents
+				l.state = ilStateTagContents
 			case GoExprStart:
 				// NOTE(ben): Go expression inside the tag somewhere. Switch back to
 				// Go and note that we just parsed a `<` from Go's perspective so we
 				// don't have to worry about semicolon insertion below.
-				s.pushOuterState()
-				s.state = ipGo
+				l.pushOuterState()
+				l.state = ilStateGo
 			}
-			if s.state == ipGo {
-				s.blankOutIngotCodeAndResetScanner()
+			if l.state == ilStateGo {
+				l.blankOutIngotCodeAndResetScanner()
 			}
 			return pos, op.tok, op.lit
 		}
-		if pos, ident := s.lexIdent(); pos != token.NoPos {
+		if pos, ident := l.lexIdent(); pos != token.NoPos {
 			return pos, Ident, ident
 		}
-		if pos, tok, lit := s.lexString(); pos != token.NoPos {
+		if pos, tok, lit := l.lexString(); pos != token.NoPos {
 			return pos, tok, lit
 		}
 
-		pos := s.pos()
-		lit := string(s.src[s.cur])
-		s.cur++
+		pos := l.pos()
+		lit := string(l.src[l.cur])
+		l.cur++
 		return pos, token.ILLEGAL, lit
-	case ipTagContents:
-		start := s.cur
-		for s.remaining() > 0 && s.src[s.cur] != '<' && !s.peekLit("{{") {
-			s.cur++
+	case ilStateTagContents:
+		start := l.cur
+		for l.remaining() > 0 && l.src[l.cur] != '<' && !l.peekLit("{{") {
+			l.cur++
 		}
 
-		if start < s.cur {
-			return s.posAt(start), TagContents, string(s.src[start:s.cur])
-		} else if s.remaining() == 0 {
-			return s.eof()
+		if start < l.cur {
+			return l.posAt(start), TagContents, string(l.src[start:l.cur])
+		} else if l.remaining() == 0 {
+			return l.eof()
 		} else {
 			// NOTE(ben): Some operator
-			pos, op := s.lexOperator()
+			pos, op := l.lexOperator()
 			utils.Assert(pos)
 			switch op.tok {
 			case GoExprStart:
-				s.pushOuterState()
-				s.state = ipGo
-				s.blankOutIngotCodeAndResetScanner()
+				l.pushOuterState()
+				l.state = ilStateGo
+				l.blankOutIngotCodeAndResetScanner()
 			case ClosingTagStart:
-				s.state = ipClosingTag
+				l.state = ilStateClosingTag
 			case TagStart:
-				s.pushOuterState()
-				s.state = ipTag
+				l.pushOuterState()
+				l.state = ilStateTag
 			default:
 				panic(fmt.Sprintf("unexpected operator %s", op.lit))
 			}
 			return pos, op.tok, op.lit
 		}
-	case ipClosingTag:
+	case ilStateClosingTag:
 		// NOTE(ben): Advance past whitespace, maybe EOF
-		for s.remaining() > 0 && isspace(s.src[s.cur]) {
-			s.cur++
+		for l.remaining() > 0 && isspace(l.src[l.cur]) {
+			l.cur++
 		}
-		if s.remaining() == 0 {
-			return s.eof()
+		if l.remaining() == 0 {
+			return l.eof()
 		}
 
 		for _, op := range operators {
-			if s.peekLit(op.lit) {
+			if l.peekLit(op.lit) {
 				if op.tok == TagEndClosed || op.tok == TagEndUnclosed {
 					// NOTE(ben): Tag closed; back to previous state
-					s.state = s.popOuterState()
+					l.state = l.popOuterState()
 				}
-				pos := s.pos()
-				s.cur += len(op.lit)
-				if s.state == ipGo {
+				pos := l.pos()
+				l.cur += len(op.lit)
+				if l.state == ilStateGo {
 					// NOTE(ben): Reset Go scanner
-					s.blankOutIngotCodeAndResetScanner()
-					s.src[s.cur-1] = '_'                  // NOTE(ben): Reset semicolon insertion
-					_, goTok, goLit := s.goScanner.Scan() // NOTE(ben): Consume the underscore
-					s.prevGoTok = token.ILLEGAL
+					l.blankOutIngotCodeAndResetScanner()
+					l.src[l.cur-1] = '_'                  // NOTE(ben): Reset semicolon insertion
+					_, goTok, goLit := l.goScanner.Scan() // NOTE(ben): Consume the underscore
+					l.prevGoTok = token.ILLEGAL
 					utils.Assert(goTok == token.IDENT && goLit == "_")
 				}
 				return pos, op.tok, op.lit
 			}
 		}
-		if pos, op := s.lexOperator(); pos != token.NoPos {
+		if pos, op := l.lexOperator(); pos != token.NoPos {
 			if op.tok == TagEndClosed || op.tok == TagEndUnclosed {
 				// NOTE(ben): Tag closed; back to previous state
-				s.state = s.popOuterState()
+				l.state = l.popOuterState()
 			}
-			if s.state == ipGo {
+			if l.state == ilStateGo {
 				// NOTE(ben): Reset Go scanner
-				s.blankOutIngotCodeAndResetScanner()
-				s.src[s.cur-1] = '_'                  // NOTE(ben): Reset semicolon insertion
-				_, goTok, goLit := s.goScanner.Scan() // NOTE(ben): Consume the underscore
+				l.blankOutIngotCodeAndResetScanner()
+				l.src[l.cur-1] = '_'                  // NOTE(ben): Reset semicolon insertion
+				_, goTok, goLit := l.goScanner.Scan() // NOTE(ben): Consume the underscore
 				utils.Assert(goTok == token.IDENT && goLit == "_")
 			}
 			return pos, op.tok, op.lit
 		}
-		if pos, ident := s.lexIdent(); pos != token.NoPos {
+		if pos, ident := l.lexIdent(); pos != token.NoPos {
 			return pos, Ident, ident
 		}
 
-		pos := s.pos()
-		lit := string(s.src[s.cur])
-		s.cur++
+		pos := l.pos()
+		lit := string(l.src[l.cur])
+		l.cur++
 		return pos, token.ILLEGAL, lit
 	default:
-		panic(fmt.Sprintf("unexpected state %v", s.state))
+		panic(fmt.Sprintf("unexpected state %v", l.state))
 	}
 }
 
-func (s *ingotScanner) peekLit(lit string) bool {
-	if s.remaining() < len(lit) {
+func (l *ingotLexer) peekLit(lit string) bool {
+	if l.remaining() < len(lit) {
 		return false
 	}
-	return string(s.src[s.cur:s.cur+len(lit)]) == lit
+	return string(l.src[l.cur:l.cur+len(lit)]) == lit
 }
 
-func (s *ingotScanner) lexOperator() (token.Pos, operator) {
+func (l *ingotLexer) lexOperator() (token.Pos, operator) {
 	for _, op := range operators {
-		if s.peekLit(op.lit) {
-			pos := s.pos()
-			s.cur += len(op.lit)
+		if l.peekLit(op.lit) {
+			pos := l.pos()
+			l.cur += len(op.lit)
 			return pos, op
 		}
 	}
 	return token.NoPos, operator{}
 }
 
-func (s *ingotScanner) lexIdent() (token.Pos, string) {
-	utils.Assert(s.remaining() > 0)
-	start := s.cur
-	if isalpha(s.src[s.cur]) {
-		s.cur++
-		for s.remaining() > 0 && (isalpha(s.src[s.cur]) || isdigit(s.src[s.cur])) {
-			s.cur++
+func (l *ingotLexer) lexIdent() (token.Pos, string) {
+	utils.Assert(l.remaining() > 0)
+	start := l.cur
+	if isalpha(l.src[l.cur]) {
+		l.cur++
+		for l.remaining() > 0 && (isalpha(l.src[l.cur]) || isdigit(l.src[l.cur])) {
+			l.cur++
 		}
-		return s.posAt(start), string(s.src[start:s.cur])
+		return l.posAt(start), string(l.src[start:l.cur])
 	}
 	return token.NoPos, ""
 }
 
-func (s *ingotScanner) lexString() (token.Pos, token.Token, string) {
-	utils.Assert(s.remaining() > 0)
-	start := s.cur
-	if s.src[s.cur] == '"' {
-		s.cur++
+func (l *ingotLexer) lexString() (token.Pos, token.Token, string) {
+	utils.Assert(l.remaining() > 0)
+	start := l.cur
+	if l.src[l.cur] == '"' {
+		l.cur++
 		escapeNext := false
-		for ; ; s.cur++ {
-			if s.remaining() == 0 {
-				return s.posAt(start), token.ILLEGAL, string(s.src[start:])
+		for ; ; l.cur++ {
+			if l.remaining() == 0 {
+				return l.posAt(start), token.ILLEGAL, string(l.src[start:])
 			}
 			if escapeNext {
 				escapeNext = false
 				continue
 			}
 
-			switch s.src[s.cur] {
+			switch l.src[l.cur] {
 			case '"':
-				s.cur++
-				return s.pos(), token.STRING, string(s.src[start:s.cur])
+				l.cur++
+				return l.pos(), token.STRING, string(l.src[start:l.cur])
 			case '\\':
 				escapeNext = true
 			}
@@ -314,43 +296,43 @@ func (s *ingotScanner) lexString() (token.Pos, token.Token, string) {
 	return token.NoPos, token.ILLEGAL, ""
 }
 
-func (s *ingotScanner) pushOuterState() {
-	s.outerStates = append(s.outerStates, s.state)
+func (l *ingotLexer) pushOuterState() {
+	l.outerStates = append(l.outerStates, l.state)
 }
 
-func (s *ingotScanner) popOuterState() ingotParserState {
-	res := s.outerStates[len(s.outerStates)-1]
-	s.outerStates = s.outerStates[:len(s.outerStates)-1]
+func (l *ingotLexer) popOuterState() ingotLexerState {
+	res := l.outerStates[len(l.outerStates)-1]
+	l.outerStates = l.outerStates[:len(l.outerStates)-1]
 	return res
 }
 
-func (s *ingotScanner) pos() token.Pos {
-	return s.posAt(s.cur)
+func (l *ingotLexer) pos() token.Pos {
+	return l.posAt(l.cur)
 }
 
-func (s *ingotScanner) posAt(offset int) token.Pos {
-	return token.Pos(s.file.Base() + offset)
+func (l *ingotLexer) posAt(offset int) token.Pos {
+	return token.Pos(l.file.Base() + offset)
 }
 
-func (s *ingotScanner) remaining() int {
-	utils.Assert(s.cur <= len(s.src))
-	return len(s.src) - s.cur
+func (l *ingotLexer) remaining() int {
+	utils.Assert(l.cur <= len(l.src))
+	return len(l.src) - l.cur
 }
 
-func (s *ingotScanner) blankOutIngotCodeAndResetScanner() {
-	for i := s.blankedCur; i < s.cur; i++ {
-		s.src[i] = ' '
+func (l *ingotLexer) blankOutIngotCodeAndResetScanner() {
+	for i := l.blankedCur; i < l.cur; i++ {
+		l.src[i] = ' '
 	}
-	s.blankedCur = s.cur
-	s.goScanner.Init(s.file, s.src, s.scanErrorHandler, scanner.ScanComments)
-	s.prevGoTok = token.ILLEGAL
+	l.blankedCur = l.cur
+	l.goScanner.Init(l.file, l.src, l.scanErrorHandler, scanner.ScanComments)
+	l.prevGoTok = token.ILLEGAL
 }
 
-func (s *ingotScanner) eof() (token.Pos, token.Token, string) {
-	return s.posAt(len(s.src)), token.EOF, ""
+func (l *ingotLexer) eof() (token.Pos, token.Token, string) {
+	return l.posAt(len(l.src)), token.EOF, ""
 }
 
-func (s *ingotScanner) scanErrorHandler(pos token.Position, msg string) {
+func (l *ingotLexer) scanErrorHandler(pos token.Position, msg string) {
 	fmt.Printf("ERROR: %s\t%s", pos, msg)
 }
 
@@ -378,4 +360,28 @@ func isspace(c byte) bool {
 // to `p.cur`.
 func scannerOffset(s *scanner.Scanner) int {
 	return int(reflect.ValueOf(s).Elem().FieldByName("offset").Int())
+}
+
+// NOTE(ben): This is far from an exact science. Certainly we need to avoid
+// those places where it is valid to put a less-than operator. But outside of
+// that, there are still many places where it is invalid to put a Go struct as
+// well, and at that point the question is: do you want the error to be a bad
+// less-than, or a bad struct?
+func tokenCanPrecedeTag(tok token.Token) bool {
+	switch tok {
+	case token.RETURN:
+		return true
+	case
+		token.INC, token.DEC,
+		token.PERIOD,
+		token.RPAREN, token.RBRACK, token.RBRACE,
+		token.SEMICOLON:
+		return false
+	default:
+		return tok.IsOperator()
+	}
+}
+
+func tokenIsGo(tok token.Token) bool {
+	return tok < ingotTokenStart
 }
