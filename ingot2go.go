@@ -9,7 +9,7 @@ import (
 	"github.com/bvisness/ingot/utils"
 )
 
-type ingotParser struct {
+type ingotScanner struct {
 	src  []byte
 	fset *token.FileSet
 	file *token.File
@@ -22,7 +22,7 @@ type ingotParser struct {
 	cur int
 
 	// For Go lexing
-	s          scanner.Scanner
+	goScanner  scanner.Scanner
 	prevGoTok  token.Token
 	blankedCur int
 }
@@ -38,14 +38,14 @@ const (
 
 // For stupid reasons, this will modify `src`.
 func ParseFile(filename string, src []byte) {
-	var p ingotParser
+	var p ingotScanner
 
 	p.src = src
 	p.fset = token.NewFileSet()
 	p.file = p.fset.AddFile(filename, p.fset.Base(), len(src))
 	p.file.SetLinesForContent(src)
 
-	p.s.Init(p.file, src, p.scanErrorHandler, scanner.ScanComments)
+	p.goScanner.Init(p.file, src, p.scanErrorHandler, scanner.ScanComments)
 
 	for {
 		pos, tok, lit := p.Lex()
@@ -108,94 +108,94 @@ var operators = []operator{
 	// specially by the Go scanner, not by the Ingot lexer.
 }
 
-func (p *ingotParser) Lex() (token.Pos, token.Token, string) {
-	switch p.state {
+func (s *ingotScanner) Lex() (token.Pos, token.Token, string) {
+	switch s.state {
 	case ipGo:
 		// NOTE(ben): Lex a Go token
-		pos, tok, lit := p.s.Scan()
+		pos, tok, lit := s.goScanner.Scan()
 		// NOTE(ben): Sync general cursor with the Go scanner.
-		p.cur = scannerOffset(&p.s)
+		s.cur = scannerOffset(&s.goScanner)
 
-		if tokenCanPrecedeTag(p.prevGoTok) && tok == token.LSS {
+		if tokenCanPrecedeTag(s.prevGoTok) && tok == token.LSS {
 			// NOTE(ben): Saw '<' in a place where tags can go; switch to Ingot and
 			// re-lex the '<' as a tag start
-			p.pushOuterState()
-			p.state = ipTag
-			p.cur = int(pos) - p.file.Base()
-			return p.Lex()
+			s.pushOuterState()
+			s.state = ipTag
+			s.cur = int(pos) - s.file.Base()
+			return s.Lex()
 		}
-		if tok == token.RBRACE && p.remaining() > 0 && p.src[p.cur] == '}' {
+		if tok == token.RBRACE && s.remaining() > 0 && s.src[s.cur] == '}' {
 			// NOTE(ben): Crude way of detecting '}}', which switches back to Ingot
-			p.state = p.popOuterState()
-			p.cur = int(pos+2) - p.file.Base()
+			s.state = s.popOuterState()
+			s.cur = int(pos+2) - s.file.Base()
 			return pos, GoExprEnd, "}}"
 		}
-		p.prevGoTok = tok
+		s.prevGoTok = tok
 		return pos, tok, lit
 	case ipTag:
 		// NOTE(ben): Advance past whitespace, maybe EOF
-		for p.remaining() > 0 && isspace(p.src[p.cur]) {
-			p.cur++
+		for s.remaining() > 0 && isspace(s.src[s.cur]) {
+			s.cur++
 		}
-		if p.remaining() == 0 {
-			return p.eof()
+		if s.remaining() == 0 {
+			return s.eof()
 		}
 
-		if pos, op := p.lexOperator(); pos != token.NoPos {
+		if pos, op := s.lexOperator(); pos != token.NoPos {
 			switch op.tok {
 			case TagEndClosed:
 				// NOTE(ben): Tag self-closed; back to previous state
-				p.state = p.popOuterState()
+				s.state = s.popOuterState()
 			case TagEndUnclosed:
 				// NOTE(ben): Now inside the tag
-				p.state = ipTagContents
+				s.state = ipTagContents
 			case GoExprStart:
 				// NOTE(ben): Go expression inside the tag somewhere. Switch back to
 				// Go and note that we just parsed a `<` from Go's perspective so we
 				// don't have to worry about semicolon insertion below.
-				p.pushOuterState()
-				p.state = ipGo
+				s.pushOuterState()
+				s.state = ipGo
 			}
-			if p.state == ipGo {
-				p.blankOutIngotCodeAndResetScanner()
+			if s.state == ipGo {
+				s.blankOutIngotCodeAndResetScanner()
 			}
 			return pos, op.tok, op.lit
 		}
-		if pos, ident := p.lexIdent(); pos != token.NoPos {
+		if pos, ident := s.lexIdent(); pos != token.NoPos {
 			return pos, Ident, ident
 		}
-		if pos, tok, lit := p.lexString(); pos != token.NoPos {
+		if pos, tok, lit := s.lexString(); pos != token.NoPos {
 			return pos, tok, lit
 		}
 
-		pos := p.pos()
-		lit := string(p.src[p.cur])
-		p.cur++
+		pos := s.pos()
+		lit := string(s.src[s.cur])
+		s.cur++
 		return pos, token.ILLEGAL, lit
 	case ipTagContents:
-		start := p.cur
-		for p.remaining() > 0 && p.src[p.cur] != '<' && !p.peekLit("{{") {
-			p.cur++
+		start := s.cur
+		for s.remaining() > 0 && s.src[s.cur] != '<' && !s.peekLit("{{") {
+			s.cur++
 		}
 
-		if start < p.cur {
-			return p.posAt(start), TagContents, string(p.src[start:p.cur])
-		} else if p.remaining() == 0 {
-			return p.eof()
+		if start < s.cur {
+			return s.posAt(start), TagContents, string(s.src[start:s.cur])
+		} else if s.remaining() == 0 {
+			return s.eof()
 		} else {
 			// NOTE(ben): Some operator
-			pos, op := p.lexOperator()
+			pos, op := s.lexOperator()
 			utils.Assert(pos)
 			switch op.tok {
 			case GoExprStart:
-				p.pushOuterState()
-				p.state = ipGo
-				p.blankOutIngotCodeAndResetScanner()
+				s.pushOuterState()
+				s.state = ipGo
+				s.blankOutIngotCodeAndResetScanner()
 			case ClosingTagStart:
-				p.state = ipClosingTag
+				s.state = ipClosingTag
 			case TagStart:
-				p.pushOuterState()
-				p.state = ipTag
+				s.pushOuterState()
+				s.state = ipTag
 			default:
 				panic(fmt.Sprintf("unexpected operator %s", op.lit))
 			}
@@ -203,109 +203,109 @@ func (p *ingotParser) Lex() (token.Pos, token.Token, string) {
 		}
 	case ipClosingTag:
 		// NOTE(ben): Advance past whitespace, maybe EOF
-		for p.remaining() > 0 && isspace(p.src[p.cur]) {
-			p.cur++
+		for s.remaining() > 0 && isspace(s.src[s.cur]) {
+			s.cur++
 		}
-		if p.remaining() == 0 {
-			return p.eof()
+		if s.remaining() == 0 {
+			return s.eof()
 		}
 
 		for _, op := range operators {
-			if p.peekLit(op.lit) {
+			if s.peekLit(op.lit) {
 				if op.tok == TagEndClosed || op.tok == TagEndUnclosed {
 					// NOTE(ben): Tag closed; back to previous state
-					p.state = p.popOuterState()
+					s.state = s.popOuterState()
 				}
-				pos := p.pos()
-				p.cur += len(op.lit)
-				if p.state == ipGo {
+				pos := s.pos()
+				s.cur += len(op.lit)
+				if s.state == ipGo {
 					// NOTE(ben): Reset Go scanner
-					p.blankOutIngotCodeAndResetScanner()
-					p.src[p.cur-1] = '_'          // NOTE(ben): Reset semicolon insertion
-					_, goTok, goLit := p.s.Scan() // NOTE(ben): Consume the underscore
-					p.prevGoTok = token.ILLEGAL
+					s.blankOutIngotCodeAndResetScanner()
+					s.src[s.cur-1] = '_'                  // NOTE(ben): Reset semicolon insertion
+					_, goTok, goLit := s.goScanner.Scan() // NOTE(ben): Consume the underscore
+					s.prevGoTok = token.ILLEGAL
 					utils.Assert(goTok == token.IDENT && goLit == "_")
 				}
 				return pos, op.tok, op.lit
 			}
 		}
-		if pos, op := p.lexOperator(); pos != token.NoPos {
+		if pos, op := s.lexOperator(); pos != token.NoPos {
 			if op.tok == TagEndClosed || op.tok == TagEndUnclosed {
 				// NOTE(ben): Tag closed; back to previous state
-				p.state = p.popOuterState()
+				s.state = s.popOuterState()
 			}
-			if p.state == ipGo {
+			if s.state == ipGo {
 				// NOTE(ben): Reset Go scanner
-				p.blankOutIngotCodeAndResetScanner()
-				p.src[p.cur-1] = '_'          // NOTE(ben): Reset semicolon insertion
-				_, goTok, goLit := p.s.Scan() // NOTE(ben): Consume the underscore
+				s.blankOutIngotCodeAndResetScanner()
+				s.src[s.cur-1] = '_'                  // NOTE(ben): Reset semicolon insertion
+				_, goTok, goLit := s.goScanner.Scan() // NOTE(ben): Consume the underscore
 				utils.Assert(goTok == token.IDENT && goLit == "_")
 			}
 			return pos, op.tok, op.lit
 		}
-		if pos, ident := p.lexIdent(); pos != token.NoPos {
+		if pos, ident := s.lexIdent(); pos != token.NoPos {
 			return pos, Ident, ident
 		}
 
-		pos := p.pos()
-		lit := string(p.src[p.cur])
-		p.cur++
+		pos := s.pos()
+		lit := string(s.src[s.cur])
+		s.cur++
 		return pos, token.ILLEGAL, lit
 	default:
-		panic(fmt.Sprintf("unexpected state %v", p.state))
+		panic(fmt.Sprintf("unexpected state %v", s.state))
 	}
 }
 
-func (p *ingotParser) peekLit(lit string) bool {
-	if p.remaining() < len(lit) {
+func (s *ingotScanner) peekLit(lit string) bool {
+	if s.remaining() < len(lit) {
 		return false
 	}
-	return string(p.src[p.cur:p.cur+len(lit)]) == lit
+	return string(s.src[s.cur:s.cur+len(lit)]) == lit
 }
 
-func (p *ingotParser) lexOperator() (token.Pos, operator) {
+func (s *ingotScanner) lexOperator() (token.Pos, operator) {
 	for _, op := range operators {
-		if p.peekLit(op.lit) {
-			pos := p.pos()
-			p.cur += len(op.lit)
+		if s.peekLit(op.lit) {
+			pos := s.pos()
+			s.cur += len(op.lit)
 			return pos, op
 		}
 	}
 	return token.NoPos, operator{}
 }
 
-func (p *ingotParser) lexIdent() (token.Pos, string) {
-	utils.Assert(p.remaining() > 0)
-	start := p.cur
-	if isalpha(p.src[p.cur]) {
-		p.cur++
-		for p.remaining() > 0 && (isalpha(p.src[p.cur]) || isdigit(p.src[p.cur])) {
-			p.cur++
+func (s *ingotScanner) lexIdent() (token.Pos, string) {
+	utils.Assert(s.remaining() > 0)
+	start := s.cur
+	if isalpha(s.src[s.cur]) {
+		s.cur++
+		for s.remaining() > 0 && (isalpha(s.src[s.cur]) || isdigit(s.src[s.cur])) {
+			s.cur++
 		}
-		return p.posAt(start), string(p.src[start:p.cur])
+		return s.posAt(start), string(s.src[start:s.cur])
 	}
 	return token.NoPos, ""
 }
 
-func (p *ingotParser) lexString() (token.Pos, token.Token, string) {
-	utils.Assert(p.remaining() > 0)
-	start := p.cur
-	if p.src[p.cur] == '"' {
-		p.cur++
+func (s *ingotScanner) lexString() (token.Pos, token.Token, string) {
+	utils.Assert(s.remaining() > 0)
+	start := s.cur
+	if s.src[s.cur] == '"' {
+		s.cur++
 		escapeNext := false
-		for ; ; p.cur++ {
-			if p.remaining() == 0 {
-				return p.posAt(start), token.ILLEGAL, string(p.src[start:])
+		for ; ; s.cur++ {
+			if s.remaining() == 0 {
+				return s.posAt(start), token.ILLEGAL, string(s.src[start:])
 			}
 			if escapeNext {
 				escapeNext = false
 				continue
 			}
 
-			switch p.src[p.cur] {
+			switch s.src[s.cur] {
 			case '"':
-				p.cur++
-				return p.pos(), token.STRING, string(p.src[start:p.cur])
+				s.cur++
+				return s.pos(), token.STRING, string(s.src[start:s.cur])
 			case '\\':
 				escapeNext = true
 			}
@@ -314,43 +314,43 @@ func (p *ingotParser) lexString() (token.Pos, token.Token, string) {
 	return token.NoPos, token.ILLEGAL, ""
 }
 
-func (p *ingotParser) pushOuterState() {
-	p.outerStates = append(p.outerStates, p.state)
+func (s *ingotScanner) pushOuterState() {
+	s.outerStates = append(s.outerStates, s.state)
 }
 
-func (p *ingotParser) popOuterState() ingotParserState {
-	res := p.outerStates[len(p.outerStates)-1]
-	p.outerStates = p.outerStates[:len(p.outerStates)-1]
+func (s *ingotScanner) popOuterState() ingotParserState {
+	res := s.outerStates[len(s.outerStates)-1]
+	s.outerStates = s.outerStates[:len(s.outerStates)-1]
 	return res
 }
 
-func (p *ingotParser) pos() token.Pos {
-	return p.posAt(p.cur)
+func (s *ingotScanner) pos() token.Pos {
+	return s.posAt(s.cur)
 }
 
-func (p *ingotParser) posAt(offset int) token.Pos {
-	return token.Pos(p.file.Base() + offset)
+func (s *ingotScanner) posAt(offset int) token.Pos {
+	return token.Pos(s.file.Base() + offset)
 }
 
-func (p *ingotParser) remaining() int {
-	utils.Assert(p.cur <= len(p.src))
-	return len(p.src) - p.cur
+func (s *ingotScanner) remaining() int {
+	utils.Assert(s.cur <= len(s.src))
+	return len(s.src) - s.cur
 }
 
-func (p *ingotParser) blankOutIngotCodeAndResetScanner() {
-	for i := p.blankedCur; i < p.cur; i++ {
-		p.src[i] = ' '
+func (s *ingotScanner) blankOutIngotCodeAndResetScanner() {
+	for i := s.blankedCur; i < s.cur; i++ {
+		s.src[i] = ' '
 	}
-	p.blankedCur = p.cur
-	p.s.Init(p.file, p.src, p.scanErrorHandler, scanner.ScanComments)
-	p.prevGoTok = token.ILLEGAL
+	s.blankedCur = s.cur
+	s.goScanner.Init(s.file, s.src, s.scanErrorHandler, scanner.ScanComments)
+	s.prevGoTok = token.ILLEGAL
 }
 
-func (p *ingotParser) eof() (token.Pos, token.Token, string) {
-	return p.posAt(len(p.src)), token.EOF, ""
+func (s *ingotScanner) eof() (token.Pos, token.Token, string) {
+	return s.posAt(len(s.src)), token.EOF, ""
 }
 
-func (p *ingotParser) scanErrorHandler(pos token.Position, msg string) {
+func (s *ingotScanner) scanErrorHandler(pos token.Position, msg string) {
 	fmt.Printf("ERROR: %s\t%s", pos, msg)
 }
 
