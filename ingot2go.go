@@ -4,30 +4,44 @@ import (
 	"fmt"
 	"go/scanner"
 	"go/token"
+	"io"
 	"reflect"
+	"slices"
 
 	"github.com/bvisness/ingot/utils"
 )
 
-// For stupid reasons, this will modify `src`.
-func ParseFile(filename string, src []byte) {
-	var p ingotLexer
+func ParseFile(filename string, src []byte, out io.Writer) {
+	var l ingotLexer
 
-	p.src = src
-	p.fset = token.NewFileSet()
-	p.file = p.fset.AddFile(filename, p.fset.Base(), len(src))
-	p.file.SetLinesForContent(src)
+	// NOTE(ben): It's very stupid, but we have to give the lexer its own copy of
+	// the source because it will actually overwrite the source with whitespace
+	// as part of babysitting the standard Go lexer.
+	l.src = slices.Clone(src)
+	l.fset = token.NewFileSet()
+	l.file = l.fset.AddFile(filename, l.fset.Base(), len(src))
+	l.file.SetLinesForContent(src)
 
-	p.goScanner.Init(p.file, src, p.scanErrorHandler, scanner.ScanComments)
+	l.goScanner.Init(l.file, src, l.scanErrorHandler, scanner.ScanComments)
+
+	// TODO(ben): Turn this and the above into constructors
+	var t goTranspiler
+	t.src = src
+	t.out = out
 
 	for {
-		pos, tok, lit := p.Lex()
+		pos, tok, lit := l.Lex()
 		if tok == token.EOF {
 			break
 		}
-		fmt.Printf("%s\t%s\t%q\n", p.fset.Position(pos), tok, lit)
+		fmt.Printf("%s\t%s\t%q\n", l.fset.Position(pos), tok, lit)
+
+		t.Pump(l.posToOffset(pos), tok, lit)
 	}
 }
+
+// ============================================================================
+// LEXER
 
 const ingotTokenStart = 1000
 
@@ -90,11 +104,14 @@ const (
 	ilStateClosingTag
 )
 
+// NOTE(ben): The final "literal" return value is normalized somewhat to always
+// return the characters recognized as the token, even for normal Go operators.
 func (l *ingotLexer) Lex() (token.Pos, token.Token, string) {
 	switch l.state {
 	case ilStateGo:
 		// NOTE(ben): Lex a Go token
-		pos, tok, lit := l.goScanner.Scan()
+		start := l.cur
+		pos, tok, _ := l.goScanner.Scan()
 		// NOTE(ben): Sync general cursor with the Go scanner.
 		l.cur = scannerOffset(&l.goScanner)
 
@@ -103,17 +120,17 @@ func (l *ingotLexer) Lex() (token.Pos, token.Token, string) {
 			// re-lex the '<' as a tag start
 			l.pushOuterState()
 			l.state = ilStateTag
-			l.cur = int(pos) - l.file.Base()
+			l.cur = l.posToOffset(pos)
 			return l.Lex()
 		}
 		if tok == token.RBRACE && l.remaining() > 0 && l.src[l.cur] == '}' {
 			// NOTE(ben): Crude way of detecting '}}', which switches back to Ingot
 			l.state = l.popOuterState()
-			l.cur = int(pos+2) - l.file.Base()
+			l.cur = l.posToOffset(pos + 2)
 			return pos, GoExprEnd, "}}"
 		}
 		l.prevGoTok = tok
-		return pos, tok, lit
+		return pos, tok, string(l.src[start:l.cur])
 	case ilStateTag:
 		// NOTE(ben): Advance past whitespace, maybe EOF
 		for l.remaining() > 0 && isspace(l.src[l.cur]) {
@@ -314,6 +331,10 @@ func (l *ingotLexer) posAt(offset int) token.Pos {
 	return token.Pos(l.file.Base() + offset)
 }
 
+func (l *ingotLexer) posToOffset(pos token.Pos) int {
+	return int(pos) - l.file.Base()
+}
+
 func (l *ingotLexer) remaining() int {
 	utils.Assert(l.cur <= len(l.src))
 	return len(l.src) - l.cur
@@ -380,6 +401,50 @@ func tokenCanPrecedeTag(tok token.Token) bool {
 	default:
 		return tok.IsOperator()
 	}
+}
+
+// ============================================================================
+// TRANSPILING TO GO
+
+type goTranspiler struct {
+	src   []byte
+	out   io.Writer
+	state ingotGoTranspilerState
+
+	firstGoTokenOffset int
+}
+
+type ingotGoTranspilerState int
+
+const (
+	igtStateGo ingotGoTranspilerState = iota
+	// TODO(ben): sigh to be honest I wish I had assembled an AST during the lexing
+	// stage because I totally could :( and it would make it way easier to do the
+	// actual transpiling part without worrying about the wrong operators in funny
+	// places etc. etc. and most of the logic is gonna be mirrored.
+)
+
+func (t *goTranspiler) Pump(offset int, tok token.Token, lit string) error {
+	switch t.state {
+	case igtStateGo:
+		if tokenIsGo(tok) {
+		} else {
+			// NOTE(ben): Emit run of Go tokens in source form
+			end := offset + len(lit)
+			_, err := t.out.Write(t.src[t.firstGoTokenOffset:end])
+			if err != nil {
+				return err
+			}
+
+			// NOTE(ben): Then switch to whatever other state (it really must be a
+			// tag)
+			switch tok {
+			case TagStart:
+				t.state = 
+			}
+		}
+	}
+	return nil
 }
 
 func tokenIsGo(tok token.Token) bool {

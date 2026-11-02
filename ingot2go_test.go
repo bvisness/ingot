@@ -1,9 +1,13 @@
 package ingot
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+)
 
 func TestIngot2Go(t *testing.T) {
 	t.Run("simple", func(t *testing.T) {
+		var out bytes.Buffer
 		ParseFile("test.ingot", []byte(`package template
 	
 func Foo(name string, class string) {
@@ -11,9 +15,11 @@ func Foo(name string, class string) {
 		<p><b>Hello</b>, {{ name }}! I have 182448574729837438928374873837482384 apples. 1e :)</p>
 	</div>
 }
-`))
+`), &out)
+		t.Log(out.String())
 	})
 	t.Run("loop", func(t *testing.T) {
+		var out bytes.Buffer
 		ParseFile("test.ingot", []byte(`package template
 	
 func Foo(names []string) {
@@ -25,6 +31,7 @@ func Foo(names []string) {
 		!
 	</div>
 }
-`))
+`), &out)
+		t.Log(out.String())
 	})
 }
