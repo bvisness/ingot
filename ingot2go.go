@@ -77,14 +77,12 @@ func tokenCanPrecedeTag(tok token.Token) bool {
 }
 
 const (
-	Text token.Token = iota + 1001 // Arbitrary tag contents
+	TagContents token.Token = iota + 1001
 
 	TagStart        // <
 	ClosingTagStart // </
 	TagEndUnclosed  // >
 	TagEndClosed    // />
-
-	DoctypeStart // <!
 
 	Ident       // e.g. div, my-element, FooBar123
 	Eq          // =
@@ -102,7 +100,6 @@ type operator struct {
 
 var operators = []operator{
 	// NOTE(ben): Longest first, at least in cases where there is ambiguity
-	{"<!", DoctypeStart},
 	{"</", ClosingTagStart}, {"/>", TagEndClosed},
 	{"<", TagStart}, {">", TagEndUnclosed},
 
@@ -144,31 +141,27 @@ func (p *ingotParser) Lex() (token.Pos, token.Token, string) {
 			return p.eof()
 		}
 
-		for _, op := range operators {
-			if p.peekLit(op.lit) {
-				switch op.tok {
-				case TagEndClosed:
-					// NOTE(ben): Tag self-closed; back to previous state
-					p.state = p.popOuterState()
-				case TagEndUnclosed:
-					// NOTE(ben): Now inside the tag
-					p.state = ipTagContents
-				case GoExprStart:
-					// NOTE(ben): Go expression inside the tag somewhere. Switch back to
-					// Go and note that we just parsed a `<` from Go's perspective so we
-					// don't have to worry about semicolon insertion below.
-					p.pushOuterState()
-					p.state = ipGo
-				}
-				pos := p.pos()
-				p.cur += len(op.lit)
-				if p.state == ipGo {
-					p.blankOutIngotCodeAndResetScanner()
-				}
-				return pos, op.tok, op.lit
+		if pos, op := p.lexOperator(); pos != token.NoPos {
+			switch op.tok {
+			case TagEndClosed:
+				// NOTE(ben): Tag self-closed; back to previous state
+				p.state = p.popOuterState()
+			case TagEndUnclosed:
+				// NOTE(ben): Now inside the tag
+				p.state = ipTagContents
+			case GoExprStart:
+				// NOTE(ben): Go expression inside the tag somewhere. Switch back to
+				// Go and note that we just parsed a `<` from Go's perspective so we
+				// don't have to worry about semicolon insertion below.
+				p.pushOuterState()
+				p.state = ipGo
 			}
+			if p.state == ipGo {
+				p.blankOutIngotCodeAndResetScanner()
+			}
+			return pos, op.tok, op.lit
 		}
-		if pos, ident := p.lexIdent(); ident != "" {
+		if pos, ident := p.lexIdent(); pos != token.NoPos {
 			return pos, Ident, ident
 		}
 		if pos, tok, lit := p.lexString(); pos != token.NoPos {
@@ -180,22 +173,34 @@ func (p *ingotParser) Lex() (token.Pos, token.Token, string) {
 		p.cur++
 		return pos, token.ILLEGAL, lit
 	case ipTagContents:
-		// NOTE(ben): Report all text as a token, or EOF
 		start := p.cur
-		for p.remaining() > 0 && p.src[p.cur] != '<' {
+		for p.remaining() > 0 && p.src[p.cur] != '<' && !p.peekLit("{{") {
 			p.cur++
 		}
-		if p.remaining() == 0 && start == p.cur {
+
+		if start < p.cur {
+			return p.posAt(start), TagContents, string(p.src[start:p.cur])
+		} else if p.remaining() == 0 {
 			return p.eof()
-		}
-		// NOTE(ben): Switch to tag or closing tag state
-		if p.peekLit("</") {
-			p.state = ipClosingTag
 		} else {
-			p.pushOuterState()
-			p.state = ipTag
+			// NOTE(ben): Some operator
+			pos, op := p.lexOperator()
+			utils.Assert(pos)
+			switch op.tok {
+			case GoExprStart:
+				p.pushOuterState()
+				p.state = ipGo
+				p.blankOutIngotCodeAndResetScanner()
+			case ClosingTagStart:
+				p.state = ipClosingTag
+			case TagStart:
+				p.pushOuterState()
+				p.state = ipTag
+			default:
+				panic(fmt.Sprintf("unexpected operator %s", op.lit))
+			}
+			return pos, op.tok, op.lit
 		}
-		return p.posAt(start), Text, string(p.src[start:p.cur])
 	case ipClosingTag:
 		// NOTE(ben): Advance past whitespace, maybe EOF
 		for p.remaining() > 0 && isspace(p.src[p.cur]) {
@@ -224,6 +229,20 @@ func (p *ingotParser) Lex() (token.Pos, token.Token, string) {
 				return pos, op.tok, op.lit
 			}
 		}
+		if pos, op := p.lexOperator(); pos != token.NoPos {
+			if op.tok == TagEndClosed || op.tok == TagEndUnclosed {
+				// NOTE(ben): Tag closed; back to previous state
+				p.state = p.popOuterState()
+			}
+			if p.state == ipGo {
+				// NOTE(ben): Reset Go scanner
+				p.blankOutIngotCodeAndResetScanner()
+				p.src[p.cur-1] = '_'          // NOTE(ben): Reset semicolon insertion
+				_, goTok, goLit := p.s.Scan() // NOTE(ben): Consume the underscore
+				utils.Assert(goTok == token.IDENT && goLit == "_")
+			}
+			return pos, op.tok, op.lit
+		}
 		if pos, ident := p.lexIdent(); pos != token.NoPos {
 			return pos, Ident, ident
 		}
@@ -242,6 +261,17 @@ func (p *ingotParser) peekLit(lit string) bool {
 		return false
 	}
 	return string(p.src[p.cur:p.cur+len(lit)]) == lit
+}
+
+func (p *ingotParser) lexOperator() (token.Pos, operator) {
+	for _, op := range operators {
+		if p.peekLit(op.lit) {
+			pos := p.pos()
+			p.cur += len(op.lit)
+			return pos, op
+		}
+	}
+	return token.NoPos, operator{}
 }
 
 func (p *ingotParser) lexIdent() (token.Pos, string) {

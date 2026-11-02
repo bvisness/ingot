@@ -7,7 +7,7 @@ func TestIngot2Go(t *testing.T) {
 	
 func Foo(name string, class string) {
 	return <div class={{ "foo " + <foo/> }}>
-		<p>Hello, {{ name }}! I have 182448574729837438928374873837482384 apples. 1e :)</p>
+		<p><b>Hello</b>, {{ name }}! I have 182448574729837438928374873837482384 apples. 1e :)</p>
 	</div>
 }
 `))
